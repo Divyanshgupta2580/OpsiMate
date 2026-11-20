@@ -38,7 +38,7 @@ import { pluralize } from '@/lib/text';
 import { getCurrentUser } from '@/lib/auth';
 import { isPlaygroundMode } from '@/lib/playground';
 import { cn } from '@/lib/utils';
-import { AiFilterResult, Alert } from '@OpsiMate/shared';
+import { AiFilterResult, Alert, AUTO_FIX_RESOLVE_REFUSED, isAutoFixed, IncidentSummary } from '@OpsiMate/shared';
 import {
 	Bell,
 	BellOff,
@@ -824,8 +824,10 @@ const Alerts = () => {
 		addAlertsToIncident,
 		removeAlertsFromIncidents,
 		openCreateDialogFor,
-		// Defined further down (it needs runBulkAction); only called when a drop lands.
+		// Defined further down (they need runBulkAction); only called when a drop lands.
 		assignAlertsToMe: (alerts) => assignAlertsToMe(alerts),
+		unassignAlerts: (alerts) => unassignAlerts(alerts),
+		confirmUnassign: (alerts, dissolving) => confirmUnassign(alerts, dissolving),
 	});
 	const bulkAction = useBulkAlertAction();
 
@@ -898,6 +900,24 @@ const Alerts = () => {
 	// Drop on the Assigned pane: the dragged unowned alerts become the dragger's. The same
 	// bulk assign-owner path as the selection bar, so the server fires its usual
 	// owner-assigned history entries and callbacks.
+	// Drop on the Unassigned pane: the dragged owned alerts lose their owner — the same
+	// bulk path as the selection bar's "unassign", so the server records it as usual (an
+	// alert that leaves its owner also leaves its incident; see the server's incident rule).
+	const unassignAlerts = async (alerts: Alert[]) =>
+		runBulkAction({ action: 'assignOwner', ownerId: null }, { title: 'Unassigned', verb: 'Unassigned' }, alerts);
+
+	// Unassigning the last owned members of an incident dissolves it: say so before doing it.
+	const confirmUnassign = (alerts: Alert[], dissolving: IncidentSummary[]) =>
+		setPendingAction({
+			title: `Unassign ${alerts.length} ${pluralize(alerts.length, 'alert')}?`,
+			description: `An alert that loses its owner also leaves its incident. This dissolves ${pluralize(dissolving.length, 'incident')} ${dissolving
+				.map((incident) => `"${incident.name}"`)
+				.join(', ')} — every member is being unassigned.`,
+			confirmLabel: 'Unassign',
+			destructive: true,
+			run: () => void unassignAlerts(alerts),
+		});
+
 	const assignAlertsToMe = async (alerts: Alert[]) => {
 		const me = getCurrentUser();
 		if (!me) {
@@ -961,7 +981,25 @@ const Alerts = () => {
 			run: (comment, silencedUntil) => void handleSilenceAlert(alertId, silencedUntil, comment),
 		});
 
-	const confirmResolveAlert = (alertId: string) =>
+	// Resolve is refused up front for an alert its source fixes on its own — the buttons
+	// are disabled, this covers any other way in (the server refuses too).
+	const refuseAutoFixResolve = (alerts: Alert[]): boolean => {
+		const autoFixed = alerts.filter(isAutoFixed);
+		if (autoFixed.length === 0) return false;
+		toast({
+			title: 'Cannot resolve',
+			description:
+				alerts.length === 1
+					? AUTO_FIX_RESOLVE_REFUSED
+					: `${autoFixed.length} of the selected ${pluralize(alerts.length, 'alert')} ${pluralize(autoFixed.length, 'is', 'are')} fixed automatically; unselect ${pluralize(autoFixed.length, 'it', 'them')} to resolve the rest`,
+			variant: 'destructive',
+		});
+		return true;
+	};
+
+	const confirmResolveAlert = (alertId: string) => {
+		const alert = loadedAlertsById.get(alertId);
+		if (alert && refuseAutoFixResolve([alert])) return;
 		setPendingAction({
 			title: 'Resolve this alert?',
 			description: 'The alert moves to the Resolved list. You can unresolve it later if it is still an issue.',
@@ -971,6 +1009,7 @@ const Alerts = () => {
 			commentPlaceholder: 'What fixed it / why is this resolved?',
 			run: (comment) => void handleDeleteAlert(alertId, comment),
 		});
+	};
 
 	const confirmDeleteResolvedAlert = (alertId: string) =>
 		setPendingAction({
@@ -1048,7 +1087,9 @@ const Alerts = () => {
 			},
 		});
 
-	const confirmResolveAllSelected = () =>
+	const confirmResolveAllSelected = () => {
+		// The loaded selection is checked here; an "all matching" scope is the server's call.
+		if (!allMatchingSelected && refuseAutoFixResolve(selectedAlerts)) return;
 		setPendingAction({
 			title: `Resolve ${bulkCount} ${pluralize(bulkCount, 'alert')}?`,
 			description:
@@ -1060,6 +1101,7 @@ const Alerts = () => {
 			commentPlaceholder: 'What fixed it / why is this resolved?',
 			run: (comment) => void handleResolveAllSelected(comment),
 		});
+	};
 
 	// Next-page triggers per view; undefined when the loaded set is complete so the
 	// table doesn't keep firing at the bottom of a fully-loaded list.
@@ -1208,8 +1250,10 @@ const Alerts = () => {
 		!(allMatchingSelected && (bulkMatchCount ?? 0) > selectedAlerts.length);
 	// Members are being dragged: the tables show the "out of the incident" drop zone.
 	const draggingMembers = alertDrag.dragging?.some((alert) => alert.incidentId != null) ?? false;
-	// Unowned alerts are being dragged: the Assigned pane can take them.
+	// Unowned alerts are being dragged: the Assigned pane can take them; owned ones: the
+	// Unassigned pane can.
 	const draggingUnowned = alertDrag.dragging?.some((alert) => alert.ownerId == null) ?? false;
+	const draggingOwned = alertDrag.dragging?.some((alert) => alert.ownerId != null) ?? false;
 	// Dragging rows into incidents: same guards, minus "something is selected" (a drag
 	// selects as it starts), plus a loaded incidents list for the drop targets.
 	const canDragIntoIncidents =
@@ -1511,6 +1555,10 @@ const Alerts = () => {
 											top={
 												<AssignmentPane
 													title="Unassigned"
+													dropTargetId={
+														canDragIntoIncidents ? dropId.unassignedPane : undefined
+													}
+													dropActive={draggingOwned}
 													// Server-counted total over the full matching set — the
 													// loaded page's split is a lie past 500 rows. Falls back
 													// to the loaded count until the first response.
